@@ -68,6 +68,11 @@ def weekdays_keyboard(offset: int) -> InlineKeyboardMarkup:
 
 def format_day(group: str, day: DaySchedule) -> str:
     lines = [f"<b>{group}</b>", "", f"<b>{day.title}</b>"]
+    if day.parse_error:
+        lines.append("Не удалось распознать формат расписания на сайте вуза.")
+        lines.append("Проверьте ссылку и структуру страницы (парсер нужно подстроить под HTML).")
+        return "\n".join(lines)
+
     if not day.lessons:
         lines.append("Выходной")
         return "\n".join(lines)

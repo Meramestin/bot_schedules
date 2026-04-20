@@ -1,10 +1,11 @@
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
-from zoneinfo import ZoneInfo
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import aiohttp
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 
 @dataclass
@@ -20,26 +21,20 @@ class Lesson:
 class DaySchedule:
     title: str
     lessons: list[Lesson]
+    parse_error: bool = False
 
 
 class ScheduleService:
     """
-    Универсальный парсер расписания.
+    Парсер расписания с несколькими стратегиями:
+    1) структурные CSS-селекторы;
+    2) fallback по текстовым заголовкам дней и времени пар.
 
-    Ожидаемая HTML-структура на странице:
-    <div class="schedule-day" data-date="YYYY-MM-DD">
-      <h3>Пн • 16.03</h3>
-      <div class="lesson">
-        <span class="subject">...</span>
-        <span class="teacher">...</span>
-        <span class="time">09:00-10:30</span>
-        <span class="kind">ЛК</span>
-        <span class="room">ГУК Б-214</span>
-      </div>
-    </div>
-
-    Подстройте селекторы под сайт вашего вуза в parse_day.
+    Это нужно, потому что разные страницы вузов (и даже один и тот же вуз)
+    могут отдавать разную HTML-структуру.
     """
+
+    DAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
     def __init__(self, url_template: str, tz: ZoneInfo) -> None:
         self.url_template = url_template
@@ -56,39 +51,158 @@ class ScheduleService:
 
     def parse_day(self, html: str, target_date: date) -> DaySchedule:
         soup = BeautifulSoup(html, "html.parser")
-        day_node = soup.select_one(f'.schedule-day[data-date="{target_date.isoformat()}"]')
-        if not day_node:
-            title = target_date.strftime("%a • %d.%m")
-            return DaySchedule(title=title, lessons=[])
 
-        title_node = day_node.select_one("h3")
-        title = title_node.get_text(strip=True) if title_node else target_date.strftime("%a • %d.%m")
+        structured = self._parse_structured_day(soup, target_date)
+        if structured is not None:
+            return structured
 
+        text_fallback = self._parse_text_day(soup, target_date)
+        if text_fallback is not None:
+            return text_fallback
+
+        title = self._default_title(target_date)
+        return DaySchedule(
+            title=title,
+            lessons=[],
+            parse_error=True,
+        )
+
+    def _parse_structured_day(self, soup: BeautifulSoup, target_date: date) -> DaySchedule | None:
+        target_iso = target_date.isoformat()
+        day_node = soup.select_one(f'.schedule-day[data-date="{target_iso}"]')
+
+        if day_node is None:
+            for selector in [
+                f'[data-date="{target_iso}"]',
+                f'[data-day-date="{target_iso}"]',
+                f'[datetime^="{target_iso}"]',
+            ]:
+                node = soup.select_one(selector)
+                if node is not None:
+                    day_node = node
+                    break
+
+        if day_node is None:
+            return None
+
+        title_node = day_node.select_one("h1, h2, h3, .day-title, .schedule-day-title")
+        title = title_node.get_text(strip=True) if title_node else self._default_title(target_date)
+
+        lesson_nodes = day_node.select(".lesson, .pair, .schedule-item, tr")
         lessons: list[Lesson] = []
-        for lesson_node in day_node.select(".lesson"):
-            lessons.append(
-                Lesson(
-                    subject=text_or_dash(lesson_node.select_one(".subject")),
-                    teacher=text_or_dash(lesson_node.select_one(".teacher")),
-                    time=text_or_dash(lesson_node.select_one(".time")),
-                    kind=text_or_dash(lesson_node.select_one(".kind")),
-                    room=text_or_dash(lesson_node.select_one(".room")),
-                )
-            )
+        for lesson_node in lesson_nodes:
+            lesson = self._extract_lesson(lesson_node)
+            if lesson:
+                lessons.append(lesson)
 
         lessons.sort(key=lambda x: _safe_time(x.time))
         return DaySchedule(title=title, lessons=lessons)
 
+    def _parse_text_day(self, soup: BeautifulSoup, target_date: date) -> DaySchedule | None:
+        lines = [line.strip() for line in soup.get_text("\n").splitlines() if line.strip()]
+        if not lines:
+            return None
 
-def text_or_dash(node) -> str:
+        day_prefix = self.DAY_NAMES[target_date.weekday()]
+        day_pattern = re.compile(rf"^({day_prefix}|{self._weekday_full_ru(target_date.weekday())})\b", re.IGNORECASE)
+        time_pattern = re.compile(r"\b\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}\b")
+
+        start = None
+        for i, line in enumerate(lines):
+            if day_pattern.search(line):
+                start = i
+                break
+
+        if start is None:
+            return None
+
+        end = len(lines)
+        other_days = [d for d in self.DAY_NAMES if d != day_prefix]
+        next_day_pattern = re.compile(rf"^({'|'.join(other_days)}|Понедельник|Вторник|Среда|Четверг|Пятница|Суббота|Воскресенье)\b", re.IGNORECASE)
+        for i in range(start + 1, len(lines)):
+            if next_day_pattern.search(lines[i]):
+                end = i
+                break
+
+        chunk = lines[start:end]
+        title = chunk[0]
+        lessons: list[Lesson] = []
+
+        i = 1
+        while i < len(chunk):
+            line = chunk[i]
+            if not time_pattern.search(line):
+                i += 1
+                continue
+
+            time = _extract_time(line)
+            subject = chunk[i + 1] if i + 1 < len(chunk) else "—"
+            teacher = chunk[i + 2] if i + 2 < len(chunk) else "—"
+            details = chunk[i + 3] if i + 3 < len(chunk) else "—"
+
+            kind, room = _split_kind_room(details)
+            lessons.append(Lesson(subject=subject, teacher=teacher, time=time, kind=kind, room=room))
+            i += 4
+
+        lessons.sort(key=lambda x: _safe_time(x.time))
+        return DaySchedule(title=title, lessons=lessons)
+
+    def _extract_lesson(self, node: Tag) -> Lesson | None:
+        subject = text_or_dash(node.select_one(".subject, .discipline, .name, td:nth-child(2)"))
+        teacher = text_or_dash(node.select_one(".teacher, .lecturer, .prep, td:nth-child(3)"))
+        time = text_or_dash(node.select_one(".time, .hours, .pair-time, td:nth-child(1)"))
+        kind = text_or_dash(node.select_one(".kind, .type, .lesson-type, td:nth-child(4)"))
+        room = text_or_dash(node.select_one(".room, .auditory, .cabinet, td:nth-child(5)"))
+
+        if subject == "—" and teacher == "—" and not re.search(r"\d{1,2}:\d{2}", time):
+            return None
+
+        if not re.search(r"\d{1,2}:\d{2}", time):
+            time = _extract_time(node.get_text(" ", strip=True))
+
+        return Lesson(subject=subject, teacher=teacher, time=time, kind=kind, room=room)
+
+    def _default_title(self, target_date: date) -> str:
+        return target_date.strftime("%a • %d.%m")
+
+    @staticmethod
+    def _weekday_full_ru(idx: int) -> str:
+        names = [
+            "Понедельник",
+            "Вторник",
+            "Среда",
+            "Четверг",
+            "Пятница",
+            "Суббота",
+            "Воскресенье",
+        ]
+        return names[idx]
+
+
+def text_or_dash(node: Tag | None) -> str:
     if node is None:
         return "—"
     return node.get_text(" ", strip=True) or "—"
 
 
+def _extract_time(value: str) -> str:
+    m = re.search(r"(\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2})", value)
+    return m.group(1).replace("–", "-") if m else "—"
+
+
+def _split_kind_room(details: str) -> tuple[str, str]:
+    details = details.strip()
+    if not details or details == "—":
+        return "—", "—"
+    parts = details.split()
+    if len(parts) == 1:
+        return parts[0], "—"
+    return parts[0], " ".join(parts[1:])
+
+
 def _safe_time(value: str) -> datetime:
     try:
-        start = value.split("-", 1)[0]
+        start = value.split("-", 1)[0].strip()
         return datetime.strptime(start, "%H:%M")
     except Exception:
         return datetime.max
