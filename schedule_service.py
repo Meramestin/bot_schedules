@@ -72,41 +72,30 @@ class ScheduleService:
         return DaySchedule(title=self._default_title(target_date), lessons=[], parse_error=True)
 
     def _parse_mai_day(self, soup: BeautifulSoup, target_date: date) -> DaySchedule | None:
-        titles = soup.select("span.step-title")
-        if not titles:
+        day_items = soup.select("li.step-item")
+        if not day_items:
             return None
 
-        matched_title: Tag | None = None
-        matched_title_text = ""
-        for title in titles:
-            title_text = normalize_space(title.get_text(" ", strip=True))
-            parsed = self._parse_mai_title_date(title_text, target_date.year)
-            if parsed and parsed == target_date:
-                matched_title = title
-                matched_title_text = title_text
-                break
-
-        if matched_title is None:
-            return None
-
-        lessons: list[Lesson] = []
-        for block in self._iter_mai_lesson_blocks(matched_title):
-            lesson = self._parse_mai_lesson_block(block)
-            if lesson is not None:
-                lessons.append(lesson)
-
-        lessons.sort(key=lambda x: _safe_time(x.time))
-        return DaySchedule(title=matched_title_text, lessons=lessons)
-
-    def _iter_mai_lesson_blocks(self, day_title: Tag):
-        for node in day_title.next_elements:
-            if node == day_title:
+        for day_item in day_items:
+            title_node = day_item.select_one("span.step-title")
+            if not title_node:
                 continue
-            if isinstance(node, Tag) and node.name == "span" and "step-title" in node.get("class", []):
-                break
-            if isinstance(node, Tag) and node.name == "div" and "mb-4" in node.get("class", []):
-                if node.select_one("p.mb-2") and node.select_one("ul.list-inline"):
-                    yield node
+
+            title_text = normalize_space(title_node.get_text(" ", strip=True))
+            parsed = self._parse_mai_title_date(title_text, target_date.year)
+            if parsed != target_date:
+                continue
+
+            lessons: list[Lesson] = []
+            for block in day_item.select("div.mb-4"):
+                lesson = self._parse_mai_lesson_block(block)
+                if lesson is not None:
+                    lessons.append(lesson)
+
+            lessons.sort(key=lambda x: _safe_time(x.time))
+            return DaySchedule(title=title_text, lessons=lessons)
+
+        return None
 
     def _parse_mai_lesson_block(self, block: Tag) -> Lesson | None:
         subject_node = block.select_one("p.mb-2")
