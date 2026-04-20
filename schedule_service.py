@@ -106,7 +106,8 @@ class ScheduleService:
             lessons.sort(key=lambda x: _safe_time(x.time))
             return DaySchedule(title=title_text, lessons=lessons)
 
-        return None
+        # Если MAI-таймлайн найден, но конкретного дня нет, считаем это выходным/пустым днём.
+        return DaySchedule(title=self._default_title(target_date), lessons=[])
 
     def _parse_mai_lesson_block(self, block: Tag) -> Lesson | None:
         subject_node = block.select_one("p.mb-2")
@@ -123,8 +124,13 @@ class ScheduleService:
         details = [normalize_space(li.get_text(" ", strip=True)) for li in items]
 
         time = _extract_time(details[0] if len(details) > 0 else "")
-        teacher = details[1] if len(details) > 1 else "—"
-        room = details[2] if len(details) > 2 else "—"
+        teacher = "—"
+        room = "—"
+        for item in details[1:]:
+            if _looks_like_room(item):
+                room = item if room == "—" else f"{room}; {item}"
+            else:
+                teacher = item if teacher == "—" else f"{teacher}; {item}"
 
         if not subject or subject == "—":
             return None
@@ -280,6 +286,11 @@ def _split_kind_room(details: str) -> tuple[str, str]:
         return parts[0], "—"
     return parts[0], " ".join(parts[1:])
 
+
+
+def _looks_like_room(value: str) -> bool:
+    text = value.lower()
+    return bool(re.search(r"(гук|каф|орш|ауд|корп|\b\d+-\d+\b|\b[а-яa-z]-\d+\b)", text))
 
 def _safe_time(value: str) -> datetime:
     try:
