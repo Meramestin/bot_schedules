@@ -25,16 +25,21 @@ class DaySchedule:
 
 
 class ScheduleService:
-    """
-    Парсер расписания с несколькими стратегиями:
-    1) структурные CSS-селекторы;
-    2) fallback по текстовым заголовкам дней и времени пар.
-
-    Это нужно, потому что разные страницы вузов (и даже один и тот же вуз)
-    могут отдавать разную HTML-структуру.
-    """
-
     DAY_NAMES = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    MONTHS_RU = {
+        "января": 1,
+        "февраля": 2,
+        "марта": 3,
+        "апреля": 4,
+        "мая": 5,
+        "июня": 6,
+        "июля": 7,
+        "августа": 8,
+        "сентября": 9,
+        "октября": 10,
+        "ноября": 11,
+        "декабря": 12,
+    }
 
     def __init__(self, url_template: str, tz: ZoneInfo) -> None:
         self.url_template = url_template
@@ -52,6 +57,10 @@ class ScheduleService:
     def parse_day(self, html: str, target_date: date) -> DaySchedule:
         soup = BeautifulSoup(html, "html.parser")
 
+        mai_day = self._parse_mai_day(soup, target_date)
+        if mai_day is not None:
+            return mai_day
+
         structured = self._parse_structured_day(soup, target_date)
         if structured is not None:
             return structured
@@ -60,12 +69,80 @@ class ScheduleService:
         if text_fallback is not None:
             return text_fallback
 
-        title = self._default_title(target_date)
-        return DaySchedule(
-            title=title,
-            lessons=[],
-            parse_error=True,
-        )
+        return DaySchedule(title=self._default_title(target_date), lessons=[], parse_error=True)
+
+    def _parse_mai_day(self, soup: BeautifulSoup, target_date: date) -> DaySchedule | None:
+        titles = soup.select("span.step-title")
+        if not titles:
+            return None
+
+        matched_title: Tag | None = None
+        matched_title_text = ""
+        for title in titles:
+            title_text = normalize_space(title.get_text(" ", strip=True))
+            parsed = self._parse_mai_title_date(title_text, target_date.year)
+            if parsed and parsed == target_date:
+                matched_title = title
+                matched_title_text = title_text
+                break
+
+        if matched_title is None:
+            return None
+
+        lessons: list[Lesson] = []
+        for block in self._iter_mai_lesson_blocks(matched_title):
+            lesson = self._parse_mai_lesson_block(block)
+            if lesson is not None:
+                lessons.append(lesson)
+
+        lessons.sort(key=lambda x: _safe_time(x.time))
+        return DaySchedule(title=matched_title_text, lessons=lessons)
+
+    def _iter_mai_lesson_blocks(self, day_title: Tag):
+        for node in day_title.next_elements:
+            if node == day_title:
+                continue
+            if isinstance(node, Tag) and node.name == "span" and "step-title" in node.get("class", []):
+                break
+            if isinstance(node, Tag) and node.name == "div" and "mb-4" in node.get("class", []):
+                if node.select_one("p.mb-2") and node.select_one("ul.list-inline"):
+                    yield node
+
+    def _parse_mai_lesson_block(self, block: Tag) -> Lesson | None:
+        subject_node = block.select_one("p.mb-2")
+        if not subject_node:
+            return None
+
+        kind_node = subject_node.select_one("span.badge")
+        kind = normalize_space(kind_node.get_text(" ", strip=True)) if kind_node else "—"
+        if kind_node:
+            kind_node.extract()
+        subject = normalize_space(subject_node.get_text(" ", strip=True)) or "—"
+
+        items = block.select("ul.list-inline li.list-inline-item")
+        details = [normalize_space(li.get_text(" ", strip=True)) for li in items]
+
+        time = _extract_time(details[0] if len(details) > 0 else "")
+        teacher = details[1] if len(details) > 1 else "—"
+        room = details[2] if len(details) > 2 else "—"
+
+        if not subject or subject == "—":
+            return None
+        return Lesson(subject=subject, teacher=teacher or "—", time=time, kind=kind, room=room or "—")
+
+    def _parse_mai_title_date(self, title: str, year: int) -> date | None:
+        text = title.lower().replace(",", " ")
+        m = re.search(r"(\d{1,2})\s+([а-яё]+)", text)
+        if not m:
+            return None
+        day = int(m.group(1))
+        month = self.MONTHS_RU.get(m.group(2))
+        if not month:
+            return None
+        try:
+            return date(year, month, day)
+        except ValueError:
+            return None
 
     def _parse_structured_day(self, soup: BeautifulSoup, target_date: date) -> DaySchedule | None:
         target_iso = target_date.isoformat()
@@ -179,10 +256,14 @@ class ScheduleService:
         return names[idx]
 
 
+def normalize_space(value: str) -> str:
+    return re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
+
+
 def text_or_dash(node: Tag | None) -> str:
     if node is None:
         return "—"
-    return node.get_text(" ", strip=True) or "—"
+    return normalize_space(node.get_text(" ", strip=True)) or "—"
 
 
 def _extract_time(value: str) -> str:
