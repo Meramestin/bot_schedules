@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -20,6 +20,7 @@ SCHEDULE_URL_TEMPLATE = os.getenv("SCHEDULE_URL_TEMPLATE", "")
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 
 USER_STATE_PATH = Path("user_state.json")
+WEEKDAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 
 @dataclass
@@ -36,66 +37,69 @@ def load_states() -> dict[str, UserState]:
 
 def save_states(states: dict[str, UserState]) -> None:
     raw = {uid: {"group": state.group} for uid, state in states.items()}
-    USER_STATE_PATH.write_text(
-        json.dumps(raw, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    USER_STATE_PATH.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def nav_keyboard(offset: int) -> InlineKeyboardMarkup:
+def week_keyboard(week_offset: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="◀️", callback_data=f"day:{offset-1}"),
-                InlineKeyboardButton(text="🏠 Сегодня", callback_data="day:0"),
-                InlineKeyboardButton(text="▶️", callback_data=f"day:{offset+1}"),
-            ],
-            [InlineKeyboardButton(text="По дням", callback_data="days:list")],
+                InlineKeyboardButton(text="◀️ Пред. неделя", callback_data=f"week:{week_offset-1}"),
+                InlineKeyboardButton(text="🏠 Эта неделя", callback_data="week:0"),
+                InlineKeyboardButton(text="След. неделя ▶️", callback_data=f"week:{week_offset+1}"),
+            ]
         ]
     )
 
 
-def weekdays_keyboard(offset: int) -> InlineKeyboardMarkup:
-    labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-    row = [
-        InlineKeyboardButton(text=label, callback_data=f"weekday:{idx}")
-        for idx, label in enumerate(labels)
+def format_week(group: str, week_start, days: list[DaySchedule]) -> str:
+    week_end = week_start + timedelta(days=6)
+    lines = [
+        f"<b>{group}</b>",
+        f"<b>Неделя {week_start.strftime('%d.%m')} — {week_end.strftime('%d.%m')}</b>",
+        "",
     ]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[row, [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"day:{offset}")]]
-    )
 
-
-def format_day(group: str, day: DaySchedule) -> str:
-    lines = [f"<b>{group}</b>", "", f"<b>{day.title}</b>"]
-    if day.parse_error:
+    if all(day.parse_error for day in days):
         lines.append("Не удалось распознать формат расписания на сайте вуза.")
-        lines.append("Проверьте ссылку и структуру страницы (парсер нужно подстроить под HTML).")
+        lines.append("Проверьте ссылку/группу и HTML-структуру страницы.")
         return "\n".join(lines)
 
-    if not day.lessons:
-        lines.append("Выходной")
-        return "\n".join(lines)
+    for idx, day in enumerate(days):
+        day_date = week_start + timedelta(days=idx)
+        lines.append(f"<b>{WEEKDAY_SHORT[idx]} • {day_date.strftime('%d.%m')}</b>")
 
-    for lesson in day.lessons:
-        lines.extend(
-            [
-                "",
-                f"<b>{lesson.subject}</b>",
-                lesson.teacher,
-                f"{lesson.time}   {lesson.kind}   {lesson.room}",
-            ]
-        )
+        if day.parse_error:
+            lines.append("Ошибка парсинга для этого дня")
+            lines.append("")
+            continue
+
+        if not day.lessons:
+            lines.append("Выходной")
+            lines.append("")
+            continue
+
+        for lesson in day.lessons:
+            lines.append(f"• <b>{lesson.subject}</b>")
+            lines.append(f"  {lesson.time} | {lesson.kind} | {lesson.room}")
+            lines.append(f"  {lesson.teacher}")
+        lines.append("")
+
     return "\n".join(lines)
 
 
-async def send_day(message: Message, service: ScheduleService, group: str, offset: int) -> None:
-    target_date = datetime.now(TZ).date() + timedelta(days=offset)
-    day_schedule = await service.get_day(group, target_date)
+def monday_for_offset(offset_weeks: int):
+    today = datetime.now(TZ).date()
+    return today - timedelta(days=today.weekday()) + timedelta(weeks=offset_weeks)
+
+
+async def send_week(message: Message, service: ScheduleService, group: str, week_offset: int) -> None:
+    week_start = monday_for_offset(week_offset)
+    days = await service.get_week(group, week_start)
     await message.answer(
-        format_day(group, day_schedule),
+        format_week(group, week_start, days),
         parse_mode="HTML",
-        reply_markup=nav_keyboard(offset),
+        reply_markup=week_keyboard(week_offset),
     )
 
 
@@ -112,28 +116,34 @@ async def main() -> None:
 
     @dp.message(CommandStart())
     async def on_start(message: Message) -> None:
-        await message.answer(
-            "Привет! Отправь код группы (например, М80-118БВ-25), и я покажу расписание."
-        )
+        await message.answer("Привет! Отправь код группы (например, М80-118БВ-25), покажу расписание на неделю.")
 
     @dp.message(Command("group"))
     async def on_group_help(message: Message) -> None:
         await message.answer("Отправь новым сообщением код группы, чтобы сменить её.")
 
+    @dp.message(Command("week"))
+    async def on_week_cmd(message: Message) -> None:
+        uid = str(message.from_user.id)
+        state = states.get(uid)
+        if not state:
+            await message.answer("Сначала отправь код группы.")
+            return
+        await send_week(message, service, state.group, 0)
+
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
         uid = str(message.from_user.id)
         text = (message.text or "").strip()
-
         if text.startswith("/"):
             return
 
         states[uid] = UserState(group=text)
         save_states(states)
-        await send_day(message, service, text, 0)
+        await send_week(message, service, text, 0)
 
-    @dp.callback_query(F.data.startswith("day:"))
-    async def on_day_nav(cb: CallbackQuery) -> None:
+    @dp.callback_query(F.data.startswith("week:"))
+    async def on_week_nav(cb: CallbackQuery) -> None:
         uid = str(cb.from_user.id)
         state = states.get(uid)
         if not state:
@@ -141,38 +151,13 @@ async def main() -> None:
             await cb.answer()
             return
 
-        offset = int(cb.data.split(":", 1)[1])
-        target_date = datetime.now(TZ).date() + timedelta(days=offset)
-        day_schedule = await service.get_day(state.group, target_date)
+        week_offset = int(cb.data.split(":", 1)[1])
+        week_start = monday_for_offset(week_offset)
+        days = await service.get_week(state.group, week_start)
         await cb.message.edit_text(
-            format_day(state.group, day_schedule),
+            format_week(state.group, week_start, days),
             parse_mode="HTML",
-            reply_markup=nav_keyboard(offset),
-        )
-        await cb.answer()
-
-    @dp.callback_query(F.data == "days:list")
-    async def on_days_list(cb: CallbackQuery) -> None:
-        await cb.message.edit_reply_markup(reply_markup=weekdays_keyboard(0))
-        await cb.answer()
-
-    @dp.callback_query(F.data.startswith("weekday:"))
-    async def on_weekday(cb: CallbackQuery) -> None:
-        uid = str(cb.from_user.id)
-        state = states.get(uid)
-        if not state:
-            await cb.answer("Сначала отправь код группы", show_alert=True)
-            return
-
-        weekday = int(cb.data.split(":", 1)[1])
-        today = datetime.now(TZ).date()
-        delta = (weekday - today.weekday()) % 7
-        target_date = today + timedelta(days=delta)
-        day_schedule = await service.get_day(state.group, target_date)
-        await cb.message.edit_text(
-            format_day(state.group, day_schedule),
-            parse_mode="HTML",
-            reply_markup=nav_keyboard(delta),
+            reply_markup=week_keyboard(week_offset),
         )
         await cb.answer()
 

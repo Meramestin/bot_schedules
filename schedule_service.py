@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -45,17 +45,28 @@ class ScheduleService:
         self.url_template = url_template
         self.tz = tz
 
-    async def get_day(self, group: str, target_date: date) -> DaySchedule:
+    async def fetch_html(self, group: str) -> str:
         encoded_group = quote(group, safe="")
         url = self.url_template.format(group=encoded_group)
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=20) as resp:
                 resp.raise_for_status()
-                html = await resp.text()
+                return await resp.text()
+
+    async def get_day(self, group: str, target_date: date) -> DaySchedule:
+        html = await self.fetch_html(group)
         return self.parse_day(html, target_date)
+
+    async def get_week(self, group: str, week_start: date) -> list[DaySchedule]:
+        html = await self.fetch_html(group)
+        soup = BeautifulSoup(html, "html.parser")
+        return [self.parse_day_from_soup(soup, week_start + timedelta(days=i)) for i in range(7)]
 
     def parse_day(self, html: str, target_date: date) -> DaySchedule:
         soup = BeautifulSoup(html, "html.parser")
+        return self.parse_day_from_soup(soup, target_date)
+
+    def parse_day_from_soup(self, soup: BeautifulSoup, target_date: date) -> DaySchedule:
 
         mai_day = self._parse_mai_day(soup, target_date)
         if mai_day is not None:
