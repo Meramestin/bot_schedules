@@ -1,9 +1,6 @@
 import asyncio
-import json
 import os
-from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
@@ -17,27 +14,10 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 SCHEDULE_URL_TEMPLATE = os.getenv("SCHEDULE_URL_TEMPLATE", "")
+FIXED_GROUP = os.getenv("FIXED_GROUP", "")
 TZ = ZoneInfo(os.getenv("TZ", "Europe/Moscow"))
 
-USER_STATE_PATH = Path("user_state.json")
 WEEKDAY_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-
-
-@dataclass
-class UserState:
-    group: str
-
-
-def load_states() -> dict[str, UserState]:
-    if not USER_STATE_PATH.exists():
-        return {}
-    raw = json.loads(USER_STATE_PATH.read_text(encoding="utf-8"))
-    return {uid: UserState(**payload) for uid, payload in raw.items()}
-
-
-def save_states(states: dict[str, UserState]) -> None:
-    raw = {uid: {"group": state.group} for uid, state in states.items()}
-    USER_STATE_PATH.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def week_keyboard(week_offset: int) -> InlineKeyboardMarkup:
@@ -93,10 +73,10 @@ def monday_for_offset(offset_weeks: int):
     return today - timedelta(days=today.weekday()) + timedelta(weeks=offset_weeks)
 
 
-async def send_week(message: Message, service: ScheduleService, group: str, week_offset: int) -> None:
+async def send_week(target_message: Message, service: ScheduleService, group: str, week_offset: int) -> None:
     week_start = monday_for_offset(week_offset)
     days = await service.get_week(group, week_start)
-    await message.answer(
+    await target_message.answer(
         format_week(group, week_start, days),
         parse_mode="HTML",
         reply_markup=week_keyboard(week_offset),
@@ -108,54 +88,37 @@ async def main() -> None:
         raise RuntimeError("Не задан BOT_TOKEN")
     if not SCHEDULE_URL_TEMPLATE:
         raise RuntimeError("Не задан SCHEDULE_URL_TEMPLATE")
+    if not FIXED_GROUP:
+        raise RuntimeError("Не задан FIXED_GROUP")
 
     bot = Bot(BOT_TOKEN)
     dp = Dispatcher()
     service = ScheduleService(SCHEDULE_URL_TEMPLATE, TZ)
-    states = load_states()
 
     @dp.message(CommandStart())
     async def on_start(message: Message) -> None:
-        await message.answer("Привет! Отправь код группы (например, М80-118БВ-25), покажу расписание на неделю.")
-
-    @dp.message(Command("group"))
-    async def on_group_help(message: Message) -> None:
-        await message.answer("Отправь новым сообщением код группы, чтобы сменить её.")
+        await message.answer(
+            f"Привет! Показываю расписание для группы {FIXED_GROUP}.",
+        )
+        await send_week(message, service, FIXED_GROUP, 0)
 
     @dp.message(Command("week"))
     async def on_week_cmd(message: Message) -> None:
-        uid = str(message.from_user.id)
-        state = states.get(uid)
-        if not state:
-            await message.answer("Сначала отправь код группы.")
-            return
-        await send_week(message, service, state.group, 0)
+        await send_week(message, service, FIXED_GROUP, 0)
 
     @dp.message(F.text)
     async def on_text(message: Message) -> None:
-        uid = str(message.from_user.id)
-        text = (message.text or "").strip()
-        if text.startswith("/"):
-            return
-
-        states[uid] = UserState(group=text)
-        save_states(states)
-        await send_week(message, service, text, 0)
+        await message.answer(
+            f"Бот закреплён за группой {FIXED_GROUP}. Используй /week для расписания недели."
+        )
 
     @dp.callback_query(F.data.startswith("week:"))
     async def on_week_nav(cb: CallbackQuery) -> None:
-        uid = str(cb.from_user.id)
-        state = states.get(uid)
-        if not state:
-            await cb.message.answer("Сначала отправь код группы.")
-            await cb.answer()
-            return
-
         week_offset = int(cb.data.split(":", 1)[1])
         week_start = monday_for_offset(week_offset)
-        days = await service.get_week(state.group, week_start)
+        days = await service.get_week(FIXED_GROUP, week_start)
         await cb.message.edit_text(
-            format_week(state.group, week_start, days),
+            format_week(FIXED_GROUP, week_start, days),
             parse_mode="HTML",
             reply_markup=week_keyboard(week_offset),
         )
