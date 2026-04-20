@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -45,7 +46,8 @@ class ScheduleService:
         self.tz = tz
 
     async def get_day(self, group: str, target_date: date) -> DaySchedule:
-        url = self.url_template.format(group=group)
+        encoded_group = quote(group, safe="")
+        url = self.url_template.format(group=encoded_group)
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=20) as resp:
                 resp.raise_for_status()

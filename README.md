@@ -19,7 +19,8 @@ cp .env.example .env
 Заполните:
 - `BOT_TOKEN` — токен от BotFather.
 - `SCHEDULE_URL_TEMPLATE` — ссылка на страницу расписания, где `{group}` заменяется на код группы.
-  - Пример: `https://myuniversity.edu/timetable/{group}`
+  - Для МАИ можно сразу использовать: `https://mai.ru/education/studies/schedule/index.php?group={group}`
+  - Код группы будет URL-encoded автоматически (например, `М8О-118БВ-25`).
 - `TZ` — часовой пояс (по умолчанию `Europe/Moscow`).
 
 ## 3) Запуск
